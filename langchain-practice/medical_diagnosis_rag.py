@@ -2,7 +2,7 @@
 """
 의료 진단 RAG 에이전트 — 근거 기반 답변 + 출처 표시 (CLI 실행판)
 
-`0610_final_exercise.ipynb` 의 LangGraph + ChatUpstage(solar-pro) 패턴을 이어받아,
+LangGraph + ChatUpstage(solar-pro) 패턴을 활용해서,
 의료 지식베이스에서 근거 문서를 검색(Retrieval)하고 그 내용만으로 답변을 생성한 뒤
 어떤 문서를 근거로 삼았는지 출처(citation)를 명시하는 RAG 파이프라인입니다.
 
@@ -26,9 +26,13 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import re
 import sys
-from typing import Annotated, List, TypedDict
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from typing import Annotated, List, Optional, TypedDict
 
 from dotenv import load_dotenv
 
@@ -176,22 +180,143 @@ KNOWLEDGE_BASE = [
 
 
 # ---------------------------------------------------------------------------
+# 2-b. PubMed 근거 수집 (NCBI E-utilities API)
+# ---------------------------------------------------------------------------
+# PubMed 웹페이지를 스크래핑하는 대신 NCBI 공식 E-utilities API로 논문 초록을
+# 구조화된 XML 형태로 받아온다. (스크래핑보다 안정적이며 NCBI 권장 방식)
+#   - efetch: PMID 로 논문 상세(제목/초록/저널/저자) 조회
+#   - esearch: 검색어로 관련 PMID 목록 조회
+EUTILS_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+NCBI_TOOL = "medical_diagnosis_rag"
+NCBI_EMAIL = os.getenv("NCBI_EMAIL", "")  # .env 의 NCBI_EMAIL (NCBI 권장: 연락 이메일 명시)
+
+
+def _eutils_get(endpoint: str, params: dict) -> bytes:
+    """E-utilities 엔드포인트에 GET 요청을 보내고 원시 응답을 반환."""
+    full = {**params, "tool": NCBI_TOOL}
+    if NCBI_EMAIL:
+        full["email"] = NCBI_EMAIL
+    url = f"{EUTILS_BASE}/{endpoint}?{urllib.parse.urlencode(full)}"
+    req = urllib.request.Request(url, headers={"User-Agent": NCBI_TOOL})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return resp.read()
+
+
+def parse_pmid(url_or_id: str) -> Optional[str]:
+    """PubMed URL 또는 숫자 문자열에서 PMID 를 추출한다."""
+    s = url_or_id.strip()
+    if s.isdigit():
+        return s
+    m = re.search(r"pubmed\.ncbi\.nlm\.nih\.gov/(\d+)", s)
+    if m:
+        return m.group(1)
+    m = re.search(r"\b(\d{5,9})\b", s)  # 마지막 수단: 5~9자리 숫자
+    return m.group(1) if m else None
+
+
+def _article_to_document(art_elem) -> Optional[Document]:
+    """<PubmedArticle> XML 요소를 출처 메타데이터가 붙은 Document 로 변환."""
+    medline = art_elem.find(".//MedlineCitation")
+    pmid = medline.findtext("PMID") if medline is not None else None
+    article = art_elem.find(".//Article")
+    if article is None:
+        return None
+
+    title = article.findtext("ArticleTitle") or "(제목 없음)"
+    journal = article.findtext(".//Journal/Title") or "PubMed"
+    year = (article.findtext(".//JournalIssue/PubDate/Year")
+            or article.findtext(".//JournalIssue/PubDate/MedlineDate") or "")
+
+    # 초록(여러 라벨 섹션으로 나뉠 수 있음)
+    parts = []
+    for ab in article.findall(".//Abstract/AbstractText"):
+        label = ab.get("Label")
+        text = "".join(ab.itertext()).strip()
+        if text:
+            parts.append(f"{label}: {text}" if label else text)
+    abstract = "\n".join(parts)
+    if not abstract:
+        return None  # 초록 없는 항목은 근거로 부적합 -> 제외
+
+    # 저자(최대 3명 + '외')
+    authors = []
+    for a in article.findall(".//AuthorList/Author"):
+        ln, fn = a.findtext("LastName"), a.findtext("ForeName")
+        if ln:
+            authors.append(f"{fn} {ln}" if fn else ln)
+    author_str = ", ".join(authors[:3]) + (" 외" if len(authors) > 3 else "")
+
+    content = f"제목: {title}\n저널: {journal} ({year})\n초록: {abstract}"
+    return Document(
+        page_content=content,
+        metadata={
+            "title": title,
+            "source": f"PubMed - {journal}" + (f" / {author_str}" if author_str else ""),
+            "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else "",
+            "published": year,
+            "pmid": pmid or "",
+        },
+    )
+
+
+def fetch_pubmed_by_ids(pmids: List[str]) -> List[Document]:
+    """PMID 목록으로 논문 초록을 받아 Document 리스트로 반환."""
+    pmids = [p for p in pmids if p]
+    if not pmids:
+        return []
+    raw = _eutils_get("efetch.fcgi", {
+        "db": "pubmed", "id": ",".join(pmids), "rettype": "abstract", "retmode": "xml",
+    })
+    root = ET.fromstring(raw)
+    docs = [d for d in (_article_to_document(a) for a in root.findall(".//PubmedArticle")) if d]
+    logger.info("[pubmed] PMID %d건 요청 -> 초록 포함 문서 %d건 수집", len(pmids), len(docs))
+    for d in docs:
+        logger.debug("[pubmed]   PMID %s | %s", d.metadata["pmid"], d.metadata["title"])
+    return docs
+
+
+def fetch_pubmed_by_query(query: str, max_results: int = 5) -> List[Document]:
+    """검색어로 관련 논문을 찾아(relevance 정렬) Document 리스트로 반환."""
+    raw = _eutils_get("esearch.fcgi", {
+        "db": "pubmed", "term": query, "retmax": max_results,
+        "retmode": "xml", "sort": "relevance",
+    })
+    root = ET.fromstring(raw)
+    ids = [e.text for e in root.findall(".//IdList/Id") if e.text]
+    logger.info("[pubmed] 검색 '%s' -> PMID %d건: %s", query, len(ids), ", ".join(ids))
+    return fetch_pubmed_by_ids(ids)
+
+
+# ---------------------------------------------------------------------------
 # 3. 벡터스토어 / 검색기 (지연 초기화)
 # ---------------------------------------------------------------------------
 retriever = None
 
 
-def build_retriever(k: int = 3):
-    """문서 분할 -> 임베딩 -> FAISS 벡터스토어 -> 검색기 구성."""
+def build_retriever(k: int = 3, extra_docs: Optional[List[Document]] = None,
+                    include_kb: bool = True):
+    """문서 분할 -> 임베딩 -> FAISS 벡터스토어 -> 검색기 구성.
+
+    extra_docs: PubMed 등에서 가져온 추가 근거 문서
+    include_kb: 내장 KNOWLEDGE_BASE 포함 여부
+    """
     global retriever
+
+    base_docs = list(KNOWLEDGE_BASE) if include_kb else []
+    if extra_docs:
+        base_docs += extra_docs
+    if not base_docs:
+        raise ValueError("근거 문서가 없습니다. KNOWLEDGE_BASE 또는 PubMed 문서가 필요합니다.")
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=400,
         chunk_overlap=50,
         separators=["\n\n", "\n", ". ", " ", ""],
     )
-    chunks = splitter.split_documents(KNOWLEDGE_BASE)
-    logger.info("지식베이스 문서 %d건 -> 청크 %d개", len(KNOWLEDGE_BASE), len(chunks))
+    chunks = splitter.split_documents(base_docs)
+    logger.info("근거 문서 %d건(내장 KB %s, 추가 %d건) -> 청크 %d개",
+                len(base_docs), "포함" if include_kb else "제외",
+                len(extra_docs) if extra_docs else 0, len(chunks))
 
     vectorstore = FAISS.from_documents(chunks, embeddings)
     retriever = vectorstore.as_retriever(search_kwargs={"k": k})
@@ -208,6 +333,7 @@ class DiagnosisState(TypedDict):
 
     question: str                   # 사용자 질문(증상)
     retrieved_docs: List[Document]  # 검색된 근거 청크
+    numbered_sources: list          # 인용 번호별 고유 출처(중복 제거됨)
     relevant: bool                  # 근거가 질문과 관련 있는지 평가 결과
     answer: str                     # 생성된 답변(본문)
     citations: list                 # 실제 사용한 출처 목록
@@ -265,9 +391,19 @@ def generate(state: DiagnosisState) -> dict:
     """근거 문서를 인용하며 답변을 생성하는 노드"""
     docs = state["retrieved_docs"]
 
+    # 동일 출처(같은 논문/문서)에서 나온 여러 청크는 하나의 인용 번호로 합친다.
+    # 식별 키 우선순위: PMID -> URL -> 제목
+    sources = []          # 고유 출처 메타데이터 (인덱스+1 = 인용 번호)
+    key_to_num = {}
     numbered = []
-    for i, d in enumerate(docs, 1):
-        numbered.append(f"[{i}] (제목: {d.metadata['title']}, 출처: {d.metadata['source']})\n{d.page_content}")
+    for d in docs:
+        m = d.metadata
+        key = m.get("pmid") or m.get("url") or m.get("title")
+        if key not in key_to_num:
+            sources.append(m)
+            key_to_num[key] = len(sources)
+        num = key_to_num[key]
+        numbered.append(f"[{num}] (제목: {m['title']}, 출처: {m['source']})\n{d.page_content}")
     context = "\n\n".join(numbered)
 
     prompt = ChatPromptTemplate.from_messages([
@@ -281,9 +417,10 @@ def generate(state: DiagnosisState) -> dict:
     chain = prompt | llm
     answer = chain.invoke({"question": state["question"], "context": context}).content
 
-    logger.info("[generate] 근거 기반 답변 생성 완료 (%d자)", len(answer))
+    logger.info("[generate] 근거 기반 답변 생성 완료 (%d자, 고유 출처 %d건)", len(answer), len(sources))
     return {
         "answer": answer,
+        "numbered_sources": sources,
         "messages": [AIMessage(name="generate", content="근거 기반 답변 생성 완료")],
     }
 
@@ -294,15 +431,15 @@ def generate(state: DiagnosisState) -> dict:
 def cite(state: DiagnosisState) -> dict:
     """답변에 실제로 사용된 근거만 골라 출처 목록을 만드는 노드"""
     answer = state["answer"]
-    docs = state["retrieved_docs"]
+    sources = state.get("numbered_sources", [])
 
     # 본문에서 실제 인용된 번호 추출 (예: [1], [2])
     used = sorted({int(n) for n in re.findall(r"\[(\d+)\]", answer)})
 
     citations = []
     for n in used:
-        if 1 <= n <= len(docs):
-            m = docs[n - 1].metadata
+        if 1 <= n <= len(sources):
+            m = sources[n - 1]
             citations.append({
                 "n": n,
                 "title": m["title"],
@@ -413,11 +550,38 @@ def main() -> None:
     parser.add_argument("--log-file", default="medical_diagnosis_rag.log", help="로그 파일 경로")
     parser.add_argument("--k", type=int, default=3, help="검색 문서 수(top-k)")
     parser.add_argument("--debug", action="store_true", help="디버그 로그 출력")
+    # PubMed 근거 옵션
+    parser.add_argument("--pubmed-url", action="append", default=[], metavar="URL_OR_PMID",
+                        help="PubMed 논문 URL 또는 PMID (여러 번 지정 가능)")
+    parser.add_argument("--pubmed-query", default=None, metavar="QUERY",
+                        help="PubMed 검색어로 관련 논문을 근거에 추가")
+    parser.add_argument("--pubmed-max", type=int, default=5,
+                        help="--pubmed-query 시 가져올 최대 논문 수")
+    parser.add_argument("--no-kb", action="store_true",
+                        help="내장 지식베이스를 빼고 PubMed 근거만 사용")
     args = parser.parse_args()
 
     setup_logging(args.log_file, level=logging.DEBUG if args.debug else logging.INFO)
 
-    build_retriever(k=args.k)
+    # PubMed 근거 수집
+    extra_docs: List[Document] = []
+    if args.pubmed_url:
+        pmids = []
+        for item in args.pubmed_url:
+            pid = parse_pmid(item)
+            if pid:
+                pmids.append(pid)
+            else:
+                logger.warning("PMID 를 추출하지 못함: %s", item)
+        extra_docs += fetch_pubmed_by_ids(pmids)
+    if args.pubmed_query:
+        extra_docs += fetch_pubmed_by_query(args.pubmed_query, args.pubmed_max)
+
+    if args.no_kb and not extra_docs:
+        logger.error("--no-kb 인데 PubMed 근거가 없습니다. --pubmed-url/--pubmed-query 를 지정하세요.")
+        return
+
+    build_retriever(k=args.k, extra_docs=extra_docs, include_kb=not args.no_kb)
     graph = build_graph()
 
     if args.question:
