@@ -1,0 +1,18 @@
+# 비밀키 / 환경변수
+.env
+*.env
+!.env.template
+
+# 파이썬 가상환경 / 캐시
+.venv/
+__pycache__/
+*.pyc
+
+# 로그
+*.log
+
+# 주피터 체크포인트
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
