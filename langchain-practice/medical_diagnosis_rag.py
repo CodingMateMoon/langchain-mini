@@ -25,6 +25,8 @@ LangGraph + ChatUpstage(solar-pro) 패턴을 활용해서,
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import logging
 import os
 import re
@@ -188,14 +190,21 @@ KNOWLEDGE_BASE = [
 #   - esearch: 검색어로 관련 PMID 목록 조회
 EUTILS_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 NCBI_TOOL = "medical_diagnosis_rag"
-NCBI_EMAIL = os.getenv("NCBI_EMAIL", "")  # .env 의 NCBI_EMAIL (NCBI 권장: 연락 이메일 명시)
+NCBI_EMAIL = os.getenv("NCBI_EMAIL", "")      # .env 의 NCBI_EMAIL (NCBI 권장: 연락 이메일 명시)
+NCBI_API_KEY = os.getenv("NCBI_API_KEY", "")  # .env 의 NCBI_API_KEY (선택: 있으면 속도 한도 3->10/초)
 
 
 def _eutils_get(endpoint: str, params: dict) -> bytes:
-    """E-utilities 엔드포인트에 GET 요청을 보내고 원시 응답을 반환."""
+    """E-utilities 엔드포인트에 GET 요청을 보내고 원시 응답을 반환.
+
+    NCBI API 키는 선택 사항이다. 값이 없으면 키 없이(초당 3회 한도) 그대로 동작하고,
+    .env 에 NCBI_API_KEY 가 있으면 자동으로 붙여 한도를 초당 10회로 높인다.
+    """
     full = {**params, "tool": NCBI_TOOL}
     if NCBI_EMAIL:
         full["email"] = NCBI_EMAIL
+    if NCBI_API_KEY:
+        full["api_key"] = NCBI_API_KEY
     url = f"{EUTILS_BASE}/{endpoint}?{urllib.parse.urlencode(full)}"
     req = urllib.request.Request(url, headers={"User-Agent": NCBI_TOOL})
     with urllib.request.urlopen(req, timeout=30) as resp:
@@ -288,17 +297,83 @@ def fetch_pubmed_by_query(query: str, max_results: int = 5) -> List[Document]:
 
 
 # ---------------------------------------------------------------------------
+# 2-c. 비용 절감 — 캐시 / 초록 요약
+# ---------------------------------------------------------------------------
+# 캐시 디렉터리(.faiss_cache): 임베딩 결과(FAISS 인덱스)와 PubMed 요약을 저장해
+# 동일 입력 재실행 시 임베딩/요약 API 호출을 생략한다. (git 추적 제외)
+CACHE_DIR = os.getenv("FAISS_CACHE_DIR", ".faiss_cache")
+SUMMARY_CACHE = os.path.join(CACHE_DIR, "pubmed_summaries.json")
+EMBED_MODEL_ID = getattr(embeddings, "model", "unknown")
+
+
+def summarize_documents(docs: List[Document], use_cache: bool = True) -> List[Document]:
+    """PubMed 초록을 핵심 근거만 남겨 요약(컨텍스트 축소) -> 토큰/비용 절감.
+
+    요약 결과는 원문 해시를 키로 디스크에 캐싱하여, 같은 초록은 두 번 요약하지 않는다.
+    """
+    if not docs:
+        return docs
+
+    cache = {}
+    if use_cache and os.path.exists(SUMMARY_CACHE):
+        try:
+            with open(SUMMARY_CACHE, encoding="utf-8") as f:
+                cache = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            cache = {}
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "다음 의학 논문 초록을 근거로 쓸 수 있도록 핵심만 5문장 이내로 요약하세요. "
+                   "대상 환자군, 원인, 진단, 치료, 경고 신호를 우선하고, 수치·약물명·균명은 반드시 보존하세요. "
+                   "추측하지 말고 초록에 있는 내용만 쓰세요."),
+        ("human", "{content}"),
+    ])
+    chain = prompt | llm
+
+    out, made, reused = [], 0, 0
+    for d in docs:
+        key = hashlib.sha256(d.page_content.encode("utf-8")).hexdigest()
+        if key in cache:
+            summary = cache[key]
+            reused += 1
+        else:
+            summary = chain.invoke({"content": d.page_content}).content
+            cache[key] = summary
+            made += 1
+        # 출처 메타데이터는 그대로 유지, 본문만 요약본으로 교체
+        out.append(Document(page_content=summary, metadata=d.metadata))
+
+    if made and use_cache:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(SUMMARY_CACHE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=1)
+    logger.info("[summarize] 요약 %d건(신규 %d, 캐시 재사용 %d)", len(out), made, reused)
+    return out
+
+
+def _docs_fingerprint(chunks: List[Document]) -> str:
+    """청크 내용 + 임베딩 모델로 캐시 키(지문)를 만든다. 내용이 바뀌면 키도 바뀜."""
+    h = hashlib.sha256()
+    h.update(EMBED_MODEL_ID.encode("utf-8"))
+    for c in sorted(chunks, key=lambda x: x.page_content):
+        h.update(b"\x00")
+        h.update(c.page_content.encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+# ---------------------------------------------------------------------------
 # 3. 벡터스토어 / 검색기 (지연 초기화)
 # ---------------------------------------------------------------------------
 retriever = None
 
 
 def build_retriever(k: int = 3, extra_docs: Optional[List[Document]] = None,
-                    include_kb: bool = True):
-    """문서 분할 -> 임베딩 -> FAISS 벡터스토어 -> 검색기 구성.
+                    include_kb: bool = True, use_cache: bool = True):
+    """문서 분할 -> (캐시 확인) -> 임베딩 -> FAISS 벡터스토어 -> 검색기 구성.
 
     extra_docs: PubMed 등에서 가져온 추가 근거 문서
     include_kb: 내장 KNOWLEDGE_BASE 포함 여부
+    use_cache: 동일 문서셋의 FAISS 인덱스를 디스크에서 재사용(임베딩 재호출 생략)
     """
     global retriever
 
@@ -318,7 +393,18 @@ def build_retriever(k: int = 3, extra_docs: Optional[List[Document]] = None,
                 len(base_docs), "포함" if include_kb else "제외",
                 len(extra_docs) if extra_docs else 0, len(chunks))
 
-    vectorstore = FAISS.from_documents(chunks, embeddings)
+    cache_path = os.path.join(CACHE_DIR, _docs_fingerprint(chunks))
+    if use_cache and os.path.isdir(cache_path):
+        vectorstore = FAISS.load_local(cache_path, embeddings,
+                                       allow_dangerous_deserialization=True)
+        logger.info("FAISS 캐시 적중 -> 임베딩 재계산 없이 로드: %s", cache_path)
+    else:
+        vectorstore = FAISS.from_documents(chunks, embeddings)
+        if use_cache:
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            vectorstore.save_local(cache_path)
+            logger.info("FAISS 캐시 저장(다음 실행부터 재사용): %s", cache_path)
+
     retriever = vectorstore.as_retriever(search_kwargs={"k": k})
     logger.info("벡터스토어 구축 완료 (top-k=%d)", k)
     return retriever
@@ -555,13 +641,19 @@ def main() -> None:
                         help="PubMed 논문 URL 또는 PMID (여러 번 지정 가능)")
     parser.add_argument("--pubmed-query", default=None, metavar="QUERY",
                         help="PubMed 검색어로 관련 논문을 근거에 추가")
-    parser.add_argument("--pubmed-max", type=int, default=5,
-                        help="--pubmed-query 시 가져올 최대 논문 수")
+    parser.add_argument("--pubmed-max", type=int, default=3,
+                        help="--pubmed-query 시 가져올 최대 논문 수 (기본 3, 토큰 절감)")
     parser.add_argument("--no-kb", action="store_true",
                         help="내장 지식베이스를 빼고 PubMed 근거만 사용")
+    # 비용 절감 옵션
+    parser.add_argument("--summarize", action="store_true",
+                        help="PubMed 초록을 요약 후 임베딩(컨텍스트 축소, 토큰 절감). 요약은 캐시됨")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="임베딩/요약 캐시를 사용하지 않음(항상 새로 계산)")
     args = parser.parse_args()
 
     setup_logging(args.log_file, level=logging.DEBUG if args.debug else logging.INFO)
+    use_cache = not args.no_cache
 
     # PubMed 근거 수집
     extra_docs: List[Document] = []
@@ -577,11 +669,16 @@ def main() -> None:
     if args.pubmed_query:
         extra_docs += fetch_pubmed_by_query(args.pubmed_query, args.pubmed_max)
 
+    # 컨텍스트 축소: PubMed 초록 요약(요약 결과는 캐시되어 1회만 LLM 호출)
+    if args.summarize and extra_docs:
+        extra_docs = summarize_documents(extra_docs, use_cache=use_cache)
+
     if args.no_kb and not extra_docs:
         logger.error("--no-kb 인데 PubMed 근거가 없습니다. --pubmed-url/--pubmed-query 를 지정하세요.")
         return
 
-    build_retriever(k=args.k, extra_docs=extra_docs, include_kb=not args.no_kb)
+    build_retriever(k=args.k, extra_docs=extra_docs, include_kb=not args.no_kb,
+                    use_cache=use_cache)
     graph = build_graph()
 
     if args.question:
